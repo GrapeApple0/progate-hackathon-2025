@@ -5,7 +5,6 @@ import boto3
 from botocore.exceptions import ClientError
 import uvicorn
 import datetime
-from openai import OpenAI
 from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
