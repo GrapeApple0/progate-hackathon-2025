@@ -2,10 +2,7 @@ fastapi
 uvicorn[standard]
 boto3
 requests
-openai
 pydantic
-sqlalchemy
-jwt
 pyjwt
 pyjwt[crypto]
 psycopg2-binary
