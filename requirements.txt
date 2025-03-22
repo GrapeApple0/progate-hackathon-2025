@@ -4,5 +4,8 @@ boto3
 requests
 openai
 pydantic
-psycopg2-binary
 sqlalchemy
+jwt
+pyjwt
+pyjwt[crypto]
+psycopg2-binary
