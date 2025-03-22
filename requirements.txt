@@ -3,3 +3,6 @@ uvicorn[standard]
 boto3
 requests
 openai
+pydantic
+psycopg2-binary
+sqlalchemy
