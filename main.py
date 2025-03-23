@@ -1,4 +1,6 @@
+from typing import Optional
 import fastapi
+from starlette.middleware.cors import CORSMiddleware
 import requests
 import json
 import boto3
@@ -19,7 +21,13 @@ from pprint import pprint
 load_dotenv()
 
 app = fastapi.FastAPI()
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,   # 追記により追加
+    allow_methods=["*"],      # 追記により追加
+    allow_headers=["*"]       # 追記により追加
+)
 #boto3 clients
 s3_client = boto3.client('s3', region_name='us-west-2')
 cognito_client = boto3.client('cognito-idp', region_name='us-west-2')
@@ -38,13 +46,14 @@ class File(BaseModel):
 
 class Authorization(BaseModel):
     token: str
+    client_id: Optional[str] = None
 
 class FileToDetect(BaseModel):
     filename: str
     filetype: str #'image/jpeg', 'image/png', 'image/gif' or 'image/webp'
 
 class FridgeValue(BaseModel):
-    items: dict[str,str]
+    items: dict[str,int]
 
 def get_url_from_s3(filename) -> str:
     url: str = s3_client.generate_presigned_url(
@@ -76,7 +85,7 @@ def _secret_hash(username) -> str:
     
     return secret_hash
 
-def verify_token(token) -> bool:
+def verify_token(token: str, client_id: str | None = None) -> bool:
     issuer = f'https://cognito-idp.us-west-2.amazonaws.com/{os.environ.get("COGNITO_USER_POOL_ID")}'
     jwks_url = f'{issuer}/.well-known/jwks.json'
 
@@ -91,11 +100,11 @@ def verify_token(token) -> bool:
             token,
             public_key,
             issuer=issuer,
-            audience=os.environ.get("COGNITO_CLIENT_ID"),
+            audience=(client_id if client_id != None else os.environ.get("COGNITO_CLIENT_ID")),
             algorithms=jwk['alg'],
         )
         pprint(claims)
-        if claims['aud'] != os.environ.get("COGNITO_CLIENT_ID"):
+        if claims['aud'] != (client_id if client_id != None else os.environ.get("COGNITO_CLIENT_ID")):
             return False
         if claims['iss'] != issuer:
             return False
@@ -107,7 +116,7 @@ def verify_token(token) -> bool:
         print("Failed to validate the token. Reason:",e)
         return False
 
-def get_username_from_token(token: str) -> str:
+def get_username_from_token(token: str, client_id: str|None = None) -> str:
     issuer = f'https://cognito-idp.us-west-2.amazonaws.com/{os.environ.get("COGNITO_USER_POOL_ID")}'
     jwks_url = f'{issuer}/.well-known/jwks.json'
 
@@ -122,10 +131,10 @@ def get_username_from_token(token: str) -> str:
             token,
             public_key,
             issuer=issuer,
-            audience=os.environ.get("COGNITO_CLIENT_ID"),
+            audience=(client_id if client_id != None else os.environ.get("COGNITO_CLIENT_ID")),
             algorithms=jwk['alg'],
         )
-        if claims['aud'] != os.environ.get("COGNITO_CLIENT_ID"):
+        if claims['aud'] != (client_id if client_id != None else os.environ.get("COGNITO_CLIENT_ID")):
             return None
         if claims['iss'] != issuer:
             return None
@@ -139,7 +148,7 @@ def get_username_from_token(token: str) -> str:
 
 @app.post("/upload")
 def upload(file: File, auth: Authorization):
-    if not verify_token(auth.token):
+    if not verify_token(auth.token, auth.client_id):
         raise fastapi.HTTPException(status_code=401, detail="Unauthorized")
     url: str = s3_client.generate_presigned_url(
         ClientMethod='put_object',
@@ -150,18 +159,18 @@ def upload(file: File, auth: Authorization):
 
 @app.post("/download")
 def download(file: File, auth: Authorization):
-    if not verify_token(auth.token):
+    if not verify_token(auth.token, auth.client_id):
         raise fastapi.HTTPException(status_code=401, detail="Unauthorized")
     url = get_url_from_s3(file.filename)
     return {"url": url}
 
 @app.post("/detect")
 def detect(file: FileToDetect, auth: Authorization):
-    if not verify_token(auth.token):
+    if not verify_token(auth.token, auth.client_id):
         raise fastapi.HTTPException(status_code=401, detail="Unauthorized")
     model_id = "anthropic.claude-3-5-sonnet-20241022-v2:0"
     # Define the prompt for the model.
-    prompt = "You're a detector of fridges.\nLet me know what are in fridges pairs name of items and count of items with json array without categorized.\nLabels should be Japanese."
+    prompt = "You're a detector of fridges.\nLet me know what are in fridges pairs name of items and count of items with json array without categorized.\nLabels should be Japanese.Moreover, please ignore the items that are not in the fridge and foods.\nExample: {\"items\": {\"りんご\": \"2\", \"みかん\": \"3\"}}"
 
     # Format the request payload using the model's native structure.
     native_request = {
@@ -212,37 +221,62 @@ def ping():
 @app.post("/verify")
 def verify(auth: Authorization):
     try:
-        return verify_token(auth.token)
-    except ClientError as e:
-        return {"error": e}
-
-@app.post("/lists")
-def lists(auth: Authorization):
-    if not verify_token(auth.token):
-        raise fastapi.HTTPException(status_code=401, detail="Unauthorized")
-    try:
-        response = cognito_client.list_users(
-            UserPoolId=os.environ.get("COGNITO_USER_POOL_ID"),
-        )
-        return response
+        return verify_token(auth.token, auth.client_id)
     except ClientError as e:
         return {"error": e}
 
 @app.post("/insert")
 def insert(value: FridgeValue,auth: Authorization):
-    if not verify_token(auth.token):
+    if not verify_token(auth.token, auth.client_id):
         raise fastapi.HTTPException(status_code=401, detail="Unauthorized")
     try:
         with pg_conn.cursor() as cur:
-            sql = "INSERT INTO ingredient_list (username) VALUES (%s) RETURNING id"
-            cur.execute(sql, (auth))
+            sql = "INSERT INTO ingredient_list (username) VALUES (%s) RETURNING id;"
+            username = get_username_from_token(auth.token, auth.client_id)
+            cur.execute(sql, (username,))
+            pg_conn.commit()
             id = cur.fetchone()[0]
-            sql = "INSERT INTO ingredient (ingredient_list_id, name, count) VALUES (%s, %s, %s)"
-            for key, value in value.items():
-                cur.execute(sql, (id, key, value))
-            return {"response": "inserted"}
-    except Exception as e:
-        return {"error": e}
+            for item, count in value.items.items():
+                sql = "INSERT INTO items (ingredient_id, name, count) VALUES (%s, %s, %s)"
+                cur.execute(sql, (id, item, count))                
+            pg_conn.commit()
+            return {"id": id}
+    except Exception as err:
+        print(err)
+        return {"error": err}
+
+@app.post("/list")
+def list(auth: Authorization):
+    if not verify_token(auth.token, auth.client_id):
+        raise fastapi.HTTPException(status_code=401, detail="Unauthorized")
+    username = get_username_from_token(auth.token, auth.client_id)
+    try:
+        with pg_conn.cursor() as cur:
+            sql = "SELECT + FROM ingredient_list where il.username = %s;"
+            cur.execute(sql, (username,))
+            # id = cur.fetchone()[0]
+            # sql = "SELECT name, count FROM items WHERE ingredient_id = %s;"
+            # cur.execute(sql, (id,))
+            items = cur.fetchall()
+            return {"items": items}
+    except Exception as err:
+        print(err)
+
+def list_items(auth: Authorization):
+    if not verify_token(auth.token, auth.client_id):
+        raise fastapi.HTTPException(status_code=401, detail="Unauthorized")
+    username = get_username_from_token(auth.token, auth.client_id)
+    try:
+        with pg_conn.cursor() as cur:
+            sql = "SELECT il.*, i.name, i.count FROM ingredient_list il JOIN items i ON il.id = i.ingredient_id where il.username = %s;"
+            cur.execute(sql, (username,))
+            # id = cur.fetchone()[0]
+            # sql = "SELECT name, count FROM items WHERE ingredient_id = %s;"
+            # cur.execute(sql, (id,))
+            items = cur.fetchall()
+            return {"items": items}
+    except Exception as err:
+        print(err)
 
 @app.post("/register")
 def register(email: str, password: str):
