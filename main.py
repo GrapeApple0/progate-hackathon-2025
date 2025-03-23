@@ -14,6 +14,7 @@ from jwt.algorithms import RSAAlgorithm
 import hmac
 import hashlib
 import psycopg2
+from pprint import pprint
 # Load environment file
 load_dotenv()
 
@@ -40,7 +41,10 @@ class Authorization(BaseModel):
 
 class FileToDetect(BaseModel):
     filename: str
-    filetype: str
+    filetype: str #'image/jpeg', 'image/png', 'image/gif' or 'image/webp'
+
+class FridgeValue(BaseModel):
+    items: dict[str,str]
 
 def get_url_from_s3(filename) -> str:
     url: str = s3_client.generate_presigned_url(
@@ -84,12 +88,13 @@ def verify_token(token) -> bool:
 
     try:
         claims = jwt.decode(
-                    token,
-                    public_key,
-                    issuer=issuer,
-                    audience=os.environ.get("COGNITO_CLIENT_ID"),
-                    algorithms=jwk['alg'],
+            token,
+            public_key,
+            issuer=issuer,
+            audience=os.environ.get("COGNITO_CLIENT_ID"),
+            algorithms=jwk['alg'],
         )
+        pprint(claims)
         if claims['aud'] != os.environ.get("COGNITO_CLIENT_ID"):
             return False
         if claims['iss'] != issuer:
@@ -102,6 +107,35 @@ def verify_token(token) -> bool:
         print("Failed to validate the token. Reason:",e)
         return False
 
+def get_username_from_token(token: str) -> str:
+    issuer = f'https://cognito-idp.us-west-2.amazonaws.com/{os.environ.get("COGNITO_USER_POOL_ID")}'
+    jwks_url = f'{issuer}/.well-known/jwks.json'
+
+    jwk_set = requests.get(jwks_url).json()
+
+    header = jwt.get_unverified_header(token)
+    jwk = next(filter(lambda x: x['kid'] == header['kid'], jwk_set['keys']))
+    public_key = RSAAlgorithm.from_jwk(json.dumps(jwk))
+
+    try:
+        claims = jwt.decode(
+            token,
+            public_key,
+            issuer=issuer,
+            audience=os.environ.get("COGNITO_CLIENT_ID"),
+            algorithms=jwk['alg'],
+        )
+        if claims['aud'] != os.environ.get("COGNITO_CLIENT_ID"):
+            return None
+        if claims['iss'] != issuer:
+            return None
+        if claims['token_use'] != "id":
+            return None
+        return claims["cognito:username"]
+    except Exception as e:
+        # だいたい期限切れのエラー
+        print("Failed to validate the token. Reason:",e)
+        return None
 
 @app.post("/upload")
 def upload(file: File, auth: Authorization):
@@ -127,7 +161,7 @@ def detect(file: FileToDetect, auth: Authorization):
         raise fastapi.HTTPException(status_code=401, detail="Unauthorized")
     model_id = "anthropic.claude-3-5-sonnet-20241022-v2:0"
     # Define the prompt for the model.
-    prompt = "You're a detector of fridges.\nLet me know what are in fridges with json array without categorized.\nLabels should be Japanese."
+    prompt = "You're a detector of fridges.\nLet me know what are in fridges pairs name of items and count of items with json array without categorized.\nLabels should be Japanese."
 
     # Format the request payload using the model's native structure.
     native_request = {
@@ -195,13 +229,17 @@ def lists(auth: Authorization):
         return {"error": e}
 
 @app.post("/insert")
-def insert(auth: Authorization):
+def insert(value: FridgeValue,auth: Authorization):
     if not verify_token(auth.token):
         raise fastapi.HTTPException(status_code=401, detail="Unauthorized")
     try:
         with pg_conn.cursor() as cur:
-            cur.execute("INSERT INTO test_table (name) VALUES ('test')")
-            pg_conn.commit()
+            sql = "INSERT INTO ingredient_list (username) VALUES (%s) RETURNING id"
+            cur.execute(sql, (auth))
+            id = cur.fetchone()[0]
+            sql = "INSERT INTO ingredient (ingredient_list_id, name, count) VALUES (%s, %s, %s)"
+            for key, value in value.items():
+                cur.execute(sql, (id, key, value))
             return {"response": "inserted"}
     except Exception as e:
         return {"error": e}
@@ -239,7 +277,6 @@ def login(username: str, password: str):
                 'SECRET_HASH': _secret_hash(username),
             }
         )
-        print(response)
         if response.get("ChallengeName") == "NEW_PASSWORD_REQUIRED":
             response = cognito_client.admin_respond_to_auth_challenge(
                 UserPoolId=os.environ.get("COGNITO_USER_POOL_ID"),
@@ -256,9 +293,6 @@ def login(username: str, password: str):
         return {"token": response}
     except ClientError as e:
         return {"error": e}
-
-def add():
-    return
 
 def main():
     uvicorn.run(app=app)
